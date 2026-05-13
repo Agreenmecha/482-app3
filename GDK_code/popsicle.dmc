@@ -1,0 +1,99 @@
+
+' popsicle.dmc ? Popsicle stick inserter
+' Axis A (linear stage) follows Axis B (conveyor belt encoder)
+' Stage:    8192 counts/rev, 16 mm/rev  -> 512 counts/mm
+' Conveyor: 20000 counts/motor rev, 2:1 gearbox, 11.906636157105316 in/rev (302.428558 mm/roller rev)
+' GR = (8192/20000) * (302.428559/16) * 0.5 = 3.87109  (negative = direction invert)
+'
+' Cycle:
+'   1. Engage gearing ? stage follows belt
+'   2. Fire output ? inserter actuates while still following
+'   3. Wait insert_ms ? hold time for stick insertion
+'   4. Disengage gearing
+'   5. Retract to start position (fast)
+'   6. Wait for B encoder to advance one popsicle spacing
+'   7. Repeat
+
+' ================================================================
+' ---- USER PARAMETERS (edit these) ----
+insert_ms  = 500;     ' time (ms) to follow belt while inserting stick
+spacingi   = 5;       ' popsicle spacing on belt (inches)
+outbit     = 1;       ' digital output bit for inserter actuator
+hmspd_mm   = 40;      ' homing speed (mm/sec)
+rspd_mm    = 200;     ' retract speed (mm/sec)
+' ================================================================
+
+' ---- Machine constants (do not change) ----
+cntmma = 8192/16;                    ' A counts per mm = 512
+cntinb = 40000/11.906636157105316;   ' B counts per inch = 3359.55
+
+' ---- Derived values (calculated automatically) ----
+spacingb = spacingi * cntinb;        ' popsicle spacing in B counts
+hmspd    = hmspd_mm * cntmma;        ' homing speed in counts/sec
+rspd     = rspd_mm * cntmma;         ' retract speed in counts/sec
+xratio   = 18.9017849375*0.5;        ' gear ratio factor
+
+CN 1;                                ' Home switch active high (change to -1 if active low)
+
+' ---- Input interrupt capture setup ----
+DM bcap[1000]       ' array for captured B positions
+bcapi = 0           ' next array index
+bcapn = 0           ' number of valid captures
+II 1                ' enable interrupt on digital input 1
+
+' ---- Homing ----
+#HOME
+KPA=20;
+KDA=100;
+KIA=0.05;
+SH A;
+SP A=hmspd;
+HM A;
+BG A;
+AM A;                        ' Wait for home complete ? position zeroed
+
+' ---- Main insert loop ----
+#LOOP
+startpos = _RPA;             ' Record A start position for this cycle
+bstart   = _RPB;             ' Record B position ? used to detect next popsicle
+
+GA B;                        ' Set B encoder as master
+GR -0.4096*xratio;           ' Engage gearing (ratio = 3.87109)
+BGA;
+
+
+SB outbit;                   ' Fire inserter ? stage is now following belt
+WT insert_ms;                ' Hold for insertion time (still following during wait)
+CB outbit;                   ' Release actuator
+
+GR 0;                        ' Disengage gearing
+
+SP A=rspd;                   ' Fast retract speed
+PA A = startpos;             ' Return to cycle start position
+BG A;
+AM A;                        ' Wait for retract complete
+
+MF B = bstart + spacingb;    ' Wait until B advances one full popsicle spacing
+                             ' Speed-independent ? works at any belt speed
+
+JP #LOOP;                    ' Next popsicle in position ? begin insert
+
+' ---- Digital input 1 interrupt ----
+#ININT
+IF (@IN[1]=0)       ' only save on input 1 rising/high transition
+    bcap[bcapi] = _RPB
+    bcapi = bcapi + 1
+    bcapn = bcapn + 1
+
+    IF (bcapi >= 1000)
+        bcapi = 0  ' wrap around after array fills
+    ENDIF
+
+    IF (bcapn > 1000)
+        bcapn = 1000
+    ENDIF
+ENDIF
+MG "BPOS = ", bcap[0]
+RI                  ' return from interrupt
+
+EN

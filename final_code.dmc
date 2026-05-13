@@ -1,0 +1,310 @@
+' Main_Popsicle_Pusher.dmc
+' Popsicle stick insertion on a moving conveyor belt.
+' Axis A (linear stage, follower) is geared to Axis C (conveyor belt, leader).
+' DI 3: popsicle sensor     (rising edge = popsicle detected)
+' DI 4: conveyor run status (HIGH = stopped, LOW = running) -- informational only
+' DO 1: pusher actuator     (pulse for pushDwl ms = 1 second)
+'
+' Sequence:
+'   1. Home Axis A -- jog to RLS (zero) then FLS (measure travel) then rest
+'   2. Launch sensor thread -- poll DI 3 continuously for popsicle detections
+'   3. Main loop (thread 0):
+'       a. Queue non-empty -- peek at oldest entry, compute tgtA
+'          If tgtA in [0, stgTravA]  -> dispatch (engage gearing, move, push, disengage, return to rest)
+'          If tgtA > stgTravA        -> not yet in stage range (wait)
+'          If tgtA < 0               -> popsicle passed RLS, discard entry
+'
+' Gearing is engaged only during dispatch (move + 1 s push) then disabled.
+' Stage returns to rest position after every push.
+'
+' Popsicle position formula (gearing converts C counts -> A counts):
+'   tgtA    = sensOfsA + (_TPC_now - C_at_detect) * grRatio
+'   moveCnt = tgtA - _TPA
+' Popsicles travel FLS->RLS so _TPC decreases as belt runs.
+' sensOfsA = stgTravA + snrFlsMM * cntPerMM  (sensor is past FLS, > stgTravA).
+' Computed after homing once stgTravA is known.
+'
+' Note: tgtA and moveCnt are time-invariant while gearing is active because
+' gearing advances _TPA at the same rate as the popsicle. Computed at peek
+' time they remain valid when the move is issued.
+
+CN 1
+CEA = 0
+CEC = 0
+
+' =====================================================================
+' KNOWN CONSTANTS  (do not change without updating physical setup)
+' =====================================================================
+stageCPR = 8192           ;' Axis A encoder counts per revolution
+stageLFR = 1.0 / 16       ;' Axis A linear feed rate (rev/mm) -- 1 rev per 16 mm
+cntPerMM = stageCPR * stageLFR  ;' = 512 counts/mm
+
+grRatio = 7.675863064180501360671552605434  ;' Axis A:C gear ratio -- positive: A moves toward RLS as C decreases (belt runs)
+
+diSens = 3                ;' digital input: popsicle optical sensor
+DI_CONV = 4               ;' digital input: conveyor status (1=stopped 0=running)
+doPush = 1                ;' digital output: pusher actuator
+
+pushDwl  = 1000           ;' pusher ON time (ms)
+queueCap = 6              ;' ring queue capacity -- max popsicles in flight
+
+' =====================================================================
+' PHYSICAL PARAMETERS  (tune per motor sizing / physical setup)
+' =====================================================================
+
+' --- Homing (Axis A) ---
+hmgVel = 50               ;' homing jog speed (mm/s)
+hmgAcc = 100              ;' homing ramp-up rate (mm/s^2)
+hmgDec = 100              ;' homing ramp-down rate (mm/s^2)
+
+' --- Rest position (where pusher waits when queue is empty) ---
+restMM = 50              ;' offset back from FLS (mm) -- 0 = rest at FLS
+
+' --- Repositioning (Axis A moves between positions) ---
+moveVel = 2000           ;' stage travel speed (mm/s)
+moveAcc = 5000             ;' stage acceleration (mm/s^2)
+moveDec = 2000            ;' stage deceleration (mm/s^2)
+
+' --- Sensor-to-pusher distance ---
+' Physical distance from the optical sensor to the pusher along the belt (mm).
+' Pusher rests at FLS so this equals the sensor-to-FLS distance.
+' Popsicles travel FLS->RLS so the sensor sits past FLS (positive value).
+snrFlsMM = 325            ;' sensor is 325 mm from pusher / past FLS
+
+' --- Dispatch position calibration offset ---
+' Fine-tune if push lands ahead (+) or behind (-) the target position.
+' Positive shifts dispatch toward FLS -- negative shifts toward RLS.
+calOfsMM = 24.5             ;' trim offset (mm) -- start at 0 then dial in
+
+' =====================================================================
+' UNIT CONVERSIONS  (all motion commands use integer counts)
+' =====================================================================
+hmgVelA  = @INT[hmgVel  * cntPerMM]  ;' homing speed     (counts/s)
+hmgAccA  = @INT[hmgAcc  * cntPerMM]  ;' homing accel     (counts/s^2)
+hmgDecA  = @INT[hmgDec  * cntPerMM]  ;' homing decel     (counts/s^2)
+
+moveVelA = @INT[moveVel * cntPerMM]  ;' travel speed     (counts/s)
+moveAccA = @INT[moveAcc * cntPerMM]  ;' acceleration     (counts/s^2)
+moveDecA = @INT[moveDec * cntPerMM]  ;' deceleration     (counts/s^2)
+
+restA    = @INT[restMM   * cntPerMM] ;' rest offset      (counts back from FLS)
+snrCnt   = @INT[snrFlsMM * cntPerMM] ;' sensor-to-pusher distance (counts)
+calCnt   = @INT[calOfsMM * cntPerMM] ;' calibration trim  (counts)
+
+' stgTravA and sensOfsA are both measured/derived at runtime during HOME_A.
+' sensOfsA = stgTravA + snrCnt  (sensor is snrCnt counts past FLS).
+' Initialized to 0 -- main loop must not run before HOME_A returns.
+stgTravA = 0
+sensOfsA = 0
+
+' =====================================================================
+' RING QUEUE GLOBALS
+' Stores _TPC snapshots (C encoder counts) at popsicle detection time.
+' FIFO: fill/proc are monotonic indices -- length = fill - proc.
+' DM array size must be a literal -- keep in sync with queueCap above.
+' Thread safety: thread 1 (sensor) writes fill -- thread 0 (main) writes proc.
+' Single-producer / single-consumer -- no locking needed.
+' =====================================================================
+DM buf[6]
+n    = queueCap           ;' runtime capacity used by Q_PUSH / Q_POP
+fill = 0                  ;' write index (monotonic)
+proc = 0                  ;' read index  (monotonic)
+
+' Dispatch workspace (written by main loop, consumed by DISPATCH)
+nextTgtA  = 0             ;' computed target A position for next popsicle (counts)
+nxtMovCt  = 0             ;' computed PR delta for next popsicle (counts)
+
+' =====================================================================
+' INITIALIZATION
+' =====================================================================
+ST A
+AM A
+MO A
+DP 0       ;' zero Axis A encoder
+DPC = 0    ;' zero Axis C encoder (conveyor belt master)
+SH A
+KPA = 50
+KDA = 100
+KIA = 0.05
+AC hmgAccA
+DC hmgDecA
+
+' =====================================================================
+' STEP 1: HOME AXIS A
+' =====================================================================
+JS #HOME_A
+sensOfsA = stgTravA + snrCnt + calCnt  ;' sensor world pos adjusted by cal offset
+
+' =====================================================================
+' STEP 2: SET TRAP PARAMS and launch sensor thread
+' Gearing is NOT engaged here -- it is engaged per-dispatch inside DSPATCH.
+' =====================================================================
+SPA = moveVelA
+ACA = moveAccA
+DCA = moveDecA
+
+XQ #SNRLOOP, 1
+
+' =====================================================================
+' STEP 3: MAIN DISPATCH LOOP (thread 0)
+' =====================================================================
+#MAINLP
+' --- check queue and dispatch (JS #DSPATCH blocks, so no re-entry guard needed) ---
+IF (fill <> proc)
+    JS #Q_PEEK                                       ;' ret = next _TPC (no dequeue)
+    nextTgtA = sensOfsA + ((_TPC - ret) * grRatio)   ;' popsicle current A pos (counts)
+
+    IF (nextTgtA < 0)
+        JS #Q_POP                                    ;' popsicle passed RLS -- discard
+    ELSE
+        IF (nextTgtA <= stgTravA)
+            JS #DSPATCH                              ;' in range -- dispatch
+        ENDIF
+        ' nextTgtA > stgTravA: popsicle not yet in stage range (between sensor and FLS)
+    ENDIF
+ENDIF
+
+JP #MAINLP
+
+' =====================================================================
+' SHUTDOWN  (unreachable from main loop -- invoke via XQ #SHTDOWN)
+' =====================================================================
+#SHTDOWN
+MO A
+EN
+
+' =====================================================================
+' SNRLOOP  (thread 1 -- runs concurrently with main dispatch loop)
+' Rising edge on diSens: snapshot _TPC and enqueue.
+' =====================================================================
+#SNRLOOP
+prevDI3 = @IN[diSens]     ;' seed state to avoid spurious trigger at start
+#snrPoll
+    curDI3 = @IN[diSens]
+    IF ((curDI3 = 1) & (prevDI3 = 0))
+        val = _TPC
+        JS #Q_PUSH
+    ENDIF
+    prevDI3 = curDI3
+    JP #snrPoll
+EN
+
+' =====================================================================
+' HOME_A: jog to RLS (zero), jog to FLS (record travel), return to rest
+' Extends the Test32 homing pattern with an FLS sweep to measure
+' stgTravA at runtime.
+' =====================================================================
+#HOME_A
+    SPA = hmgVelA         ;' set trap speed for PA return move at end
+
+    ' --- Step 1: jog negative until RLS triggers ---
+    JG -hmgVelA
+    BG A
+#hmgRLS
+    JP #hmgRLS,(_LRA=1)
+    ST A
+    AM A
+    WT 250
+    DP 0                  ;' define RLS as position zero
+
+    ' --- Step 2: jog positive until FLS triggers ---
+    JG hmgVelA
+    BG A
+#hmgFLS
+    JP #hmgFLS,(_LFA=1)
+    ST A
+    AM A
+    WT 250
+    stgTravA = _TPA       ;' record full travel range (counts from RLS to FLS)
+
+    ' --- Step 3: move to rest position (100 mm back from FLS) ---
+    PAA = stgTravA - restA
+    BG A
+    AM A
+EN
+
+' =====================================================================
+' DISPATCH: engage gearing, move to popsicle, push, disengage, return to rest
+' Gearing is engaged first so _TPA is at the correct reference when the
+' PR move is computed. Sensor thread (thread 1) keeps polling throughout.
+' =====================================================================
+#DSPATCH
+    GA C
+    GRA = grRatio              ;' engage gearing once for the whole chain
+#dspLp
+    SPA = moveVelA             ;' dispatch speed (restored here on every loop entry)
+    JS #Q_PEEK                 ;' peek: ret = C at detection (item stays in queue)
+    nextTgtA = sensOfsA + ((_TPC - ret) * grRatio)  ;' popsicle pos with fresh _TPC
+    nxtMovCt = @INT[nextTgtA - _TPA]
+    IP A=nxtMovCt              ;' relative move superimposed on active gearing (not PR)
+    AM A
+
+    SB doPush                  ;' gearing keeps stage on popsicle during push
+    WT pushDwl
+    CB doPush
+
+    JS #Q_POP                  ;' stick inserted -- now dequeue the processed popsicle
+
+    ' --- post-push: case A in-range, case B/C return to rest ---
+#chkNxt
+    doLoop = 0
+    IF (fill <> proc)
+        JS #Q_PEEK
+        nextTgtA = sensOfsA + ((_TPC - ret) * grRatio)
+        IF (nextTgtA < 0)
+            JS #Q_POP          ;' past RLS -- discard
+            doLoop = 1         ;' recheck
+        ENDIF
+        IF ((nextTgtA >= 0) & (nextTgtA <= stgTravA))
+            doLoop = 2         ;' in range -- dispatch directly
+        ENDIF
+    ENDIF
+    JP #dspLp,(doLoop = 2)     ;' Case A: dispatch next popsicle immediately
+    JP #chkNxt,(doLoop = 1)    ;' discard happened -- recheck
+
+    ' Cases B and C: disengage gearing, return toward rest
+    GRA = 0
+    PAA = stgTravA - restA     ;' start return move (non-blocking)
+    BG A
+#retLp
+    doLoop = 0
+    IF (fill <> proc)
+        JS #Q_PEEK
+        nextTgtA = sensOfsA + ((_TPC - ret) * grRatio)
+        IF ((nextTgtA >= 0) & (nextTgtA <= stgTravA))
+            doLoop = 1         ;' popsicle entered range during return
+        ENDIF
+    ENDIF
+    JP #gotIt,(doLoop = 1)     ;' Case C: intercept -- stop and re-engage
+    JP #retLp,(_BGA = 1)       ;' still moving -- keep polling
+    JP #retDn                  ;' Case B: motion complete, at rest
+
+#gotIt
+    ST A
+    AM A
+    GA C
+    GRA = grRatio              ;' re-engage gearing at current position
+    JP #dspLp                  ;' dispatch intercepted popsicle
+
+#retDn
+EN
+
+' =====================================================================
+' RING QUEUE SUBROUTINES
+' =====================================================================
+#Q_PUSH               ;' input:  val  (_TPC snapshot to enqueue) -- thread 1
+    widx = (fill % n)
+    buf[widx] = val
+    fill = fill + 1
+EN
+
+#Q_POP                ;' output: ret  (oldest _TPC value -- removes) -- thread 0
+    ridx = (proc % n)
+    ret = buf[ridx]
+    proc = proc + 1
+EN
+
+#Q_PEEK               ;' output: ret  (oldest _TPC value -- no remove) -- thread 0
+    ridx = (proc % n)
+    ret = buf[ridx]
+EN

@@ -1,0 +1,163 @@
+' a_follows_head.dmc
+
+xratio = 18.9017849375 * 0.5;
+grval  = -0.4096 * xratio;
+spcps  = 50000;
+accps  = 500000;
+dwlms  = 5000;
+
+qsize  = 32;
+DM bqueue[32];
+qhead  = 0;
+qtail  = 0;
+qcount = 0;
+pushval = 0;
+popval  = 0;
+pushok  = 0;
+popok   = 0;
+
+in1prv  = 0;
+B0      = 0;
+activB  = 0;
+newB    = 0;
+delta   = 0;
+mode    = 0;
+tend    = 0;
+
+DPA = 0;
+KPA = 20;
+KDA = 100;
+KIA = 0.05;
+GA B;
+GR grval;
+SH A;
+SP A=spcps;
+AC A=accps;
+DC A=accps;
+
+B0     = _TPB;
+activB = B0;
+
+MG "Ready.";
+
+#MAIN
+in1now = @IN[1];
+JP #NOEDG, (in1now=0) | (in1prv=1);
+pushval = _TPB;
+JS #PUSH;
+JP #SFULL, pushok=0;
+MG "PUSH ", pushval, " n=", qcount;
+JP #SAFT;
+#SFULL
+MG "FULL";
+#SAFT
+#NOEDG
+in1prv = in1now;
+
+JP #IDLE, mode=0;
+tnow = TIME;
+JP #MAIN, tnow < tend;
+mode = 0;
+MG "dwell done";
+JP #MAIN;
+
+#IDLE
+JP #MAIN, qcount=0;
+JS #POP;
+newB  = popval;
+delta = -grval * (newB - activB);
+IP A=delta;
+AM A;
+activB = newB;
+MG "lock ", activB, " d=", delta;
+mode = 1;
+tend = TIME + dwlms;
+JP #MAIN;
+EN
+
+#PUSH
+JP #PUFUL, qcount >= qsize;
+bqueue[qtail] = pushval;
+qtail = qtail + 1;
+JP #PUNW, qtail < qsize;
+qtail = 0;
+#PUNW
+qcount = qcount + 1;
+pushok = 1;
+EN
+#PUFUL
+pushok = 0;
+EN
+
+#POP
+JP #POEMP, qcount=0;
+popval = bqueue[qhead];
+qhead = qhead + 1;
+JP #PONW, qhead < qsize;
+qhead = 0;
+#PONW
+qcount = qcount - 1;
+popok = 1;
+EN
+#POEMP
+popok = 0;
+EN
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

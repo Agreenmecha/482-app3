@@ -1,0 +1,17 @@
+' Axis A (linear stage) follows Axis C (conveyor belt)
+' Stage:    8192 counts/rev, 16 mm/rev
+' Conveyor: 20000 counts/motor rev, 2:1 gearbox, 11.906636157105316 in/rev (302.428558 mm/roller rev)
+
+CN 1
+#follow
+DPA = 0
+KPA=20;      ' Proportional gain
+KDA=100;     ' Derivative gain
+KIA=0.05;    ' Integrator gain
+
+
+GA C;        ' Set C main encoder as master for A
+GR 7.6539320268542713567839195979899; 
+
+SH A;        ' Enable A axis servo
+EN

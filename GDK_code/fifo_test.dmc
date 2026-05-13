@@ -1,0 +1,120 @@
+' fifo_test.dmc
+' Ring-buffer FIFO test:
+'   Input 1 rising edge  -> push _TPB onto queue
+'   Input 2 rising edge  -> pop front of queue
+' Run with XQ. Watch terminal for PUSH/POP messages.
+
+' ---- queue capacity (must match DM literal below) ----
+qsize = 32;
+DM bqueue[32];
+
+qhead  = 0;
+qtail  = 0;
+qcount = 0;
+
+pushval  = 0;
+popval   = 0;
+peekval  = 0;
+pushok   = 0;
+popok    = 0;
+peekok   = 0;
+
+in1prv = 0;
+in2prv = 0;
+in3prv = 0;
+
+MG "FIFO test. In1=push _TPB. In2=pop front. In3=peek front.";
+
+#MAIN
+' --- rising edge on Input 1 -> push ---
+in1now = @IN[1];
+JP #NOP1, (in1now=0) | (in1prv=1);
+pushval = _TPB;
+JS #PUSH;
+JP #FULL1, pushok=0;
+MG "PUSH B=", pushval, " n=", qcount;
+JP #AFT1;
+#FULL1
+MG "FULL drop B=", pushval;
+#AFT1
+#NOP1
+in1prv = in1now;
+
+' --- rising edge on Input 2 -> pop ---
+in2now = @IN[2];
+JP #NOP2, (in2now=0) | (in2prv=1);
+JS #POP;
+JP #EMPT2, popok=0;
+MG "POP  B=", popval, " n=", qcount;
+JP #AFT2;
+#EMPT2
+MG "EMPTY";
+#AFT2
+#NOP2
+in2prv = in2now;
+
+' --- rising edge on Input 3 -> peek ---
+in3now = @IN[3];
+JP #NOP3, (in3now=0) | (in3prv=1);
+JS #PEEK;
+JP #PEKE3, peekok=0;
+MG "PEEK B=", peekval, " n=", qcount;
+JP #AFT3;
+#PEKE3
+MG "EMPTY (peek)";
+#AFT3
+#NOP3
+in3prv = in3now;
+
+JP #MAIN
+EN
+
+' ============================================================
+' #PUSH: enqueue value in 'pushval'.
+'   on return: pushok = 1 success, 0 if queue full (value dropped)
+' ============================================================
+#PUSH
+JP #PUFUL, qcount >= qsize;
+bqueue[qtail] = pushval;
+qtail = qtail + 1;
+JP #PUNW, qtail < qsize;
+qtail = 0;
+#PUNW
+qcount = qcount + 1;
+pushok = 1;
+EN
+#PUFUL
+pushok = 0;
+EN
+
+' ============================================================
+' #POP: dequeue front into 'popval'.
+'   on return: popok = 1 success, 0 if queue empty (popval invalid)
+' ============================================================
+#POP
+JP #POEMP, qcount=0;
+popval = bqueue[qhead];
+qhead = qhead + 1;
+JP #PONW, qhead < qsize;
+qhead = 0;
+#PONW
+qcount = qcount - 1;
+popok = 1;
+EN
+#POEMP
+popok = 0;
+EN
+
+
+' ============================================================
+' #PEEK: peek at front of queue into 'peekval' (no dequeue).
+'   on return: peekok = 1 success, 0 if queue empty (peekval invalid)
+' ============================================================
+#PEEK
+JP #PEEMP, qcount=0;
+peekval = bqueue[qhead];
+peekok = 1;
+EN
+#PEEMP
+peekok = 0;
+EN

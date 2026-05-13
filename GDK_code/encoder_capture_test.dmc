@@ -1,0 +1,30 @@
+' encoder_capture_test.dmc
+' On each rising edge of Input 1, capture _TPB (B-axis encoder) into bcap[].
+' Run with XQ. Read results at the terminal: bcap[0]=?  bcap[1]=?  ...
+
+' ---- USER PARAMETERS ----
+nsamp = 100;        ' number of edges to capture
+debms = 5;          ' debounce delay (ms)
+
+DM bcap[100];       ' storage;
+idx = 0;
+
+MG "Capture test ready. Trigger Input 1.";
+
+#START
+JP #DONE, idx >= nsamp;
+
+#WAITLO
+JP #WAITLO, @IN[1]=1;
+
+AI 1;
+
+bcap[idx] = _TPB;
+MG "i=", idx, " B=", bcap[idx];
+idx = idx + 1;
+WT debms;
+JP #START;
+
+#DONE
+MG "Done. ", idx, " samples captured.";
+EN
