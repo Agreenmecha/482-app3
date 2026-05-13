@@ -1,7 +1,8 @@
 ' Axis A (linear stage) follows Axis C (conveyor belt)
 ' Stage:    8192 counts/rev, 16 mm/rev
 ' Conveyor: 20000 counts/motor rev, 2:1 gearbox, 11.906636157105316 in/rev (302.428558 mm/roller rev)
-
+CEC=0
+CEA=0
 CN 1
 #follow
 DPA = 0
